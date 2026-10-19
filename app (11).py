@@ -31,7 +31,7 @@ st.set_page_config(page_title="Title Studio", page_icon="🎯", layout="centered
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+GEMINI_FALLBACK = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]   # last resort only; names get retired
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 BATCH_SIZE = 10
 MAX_TITLE_CHARS = 70
@@ -247,13 +247,59 @@ def parse_batch(text):
     return data if isinstance(data, list) else []
 
 
+_MODEL_CACHE = {}
+
+
+def discover_models(api_key):
+    """Ask Google which Gemini 'flash' models can be used right now (newest stable first).
+    Model names get retired, so a fixed list goes stale. Returns [] on any failure."""
+    if "list" in _MODEL_CACHE:
+        return _MODEL_CACHE["list"]
+    found = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"pageSize": 200}, headers={"x-goog-api-key": api_key}, timeout=20)
+        if r.status_code == 200:
+            skip = ("image", "tts", "audio", "live", "embed", "robot", "computer", "vision", "learnlm", "gemma")
+            rows = []
+            for m in r.json().get("models", []):
+                name = str(m.get("name", "")).replace("models/", "")
+                if not name.startswith("gemini") or "flash" not in name:
+                    continue
+                if any(t in name for t in skip):
+                    continue
+                if "generateContent" not in (m.get("supportedGenerationMethods") or []):
+                    continue
+                ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+                version = float(ver.group(1)) if ver else 0.0
+                unstable = any(t in name for t in ("preview", "exp", "-0"))
+                lite = "lite" in name
+                rows.append((-version, unstable, lite, name))
+            rows.sort()
+            found = [x[3] for x in rows]
+    except Exception:
+        found = []
+    if found:
+        _MODEL_CACHE["list"] = found
+    return found
+
+
+def candidate_models(api_key, override=""):
+    """Override first, then Google's self-updating alias, then whatever Google lists, then old names."""
+    out = []
+    for m in [override, "gemini-flash-latest"] + discover_models(api_key)[:5] + ["gemini-flash-lite-latest"] + GEMINI_FALLBACK:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
 def call_gemini(user_prompt):
     """Returns (text, model_used, error_message)."""
     key = _secret("GEMINI_API_KEY")
     if not key:
         return None, None, "GEMINI_API_KEY is missing from Secrets."
-    models = [_secret("GEMINI_MODEL")] if _secret("GEMINI_MODEL") else []
-    models += [m for m in MODEL_CANDIDATES if m not in models]
+    models = candidate_models(key, _secret("GEMINI_MODEL") or "")
+    errors = []
     last_err = "unknown error"
     for model in models:
         body = {
@@ -290,7 +336,8 @@ def call_gemini(user_prompt):
                 if "API key" in r.text or r.status_code in (401, 403):
                     return None, None, f"Gemini rejected the API key ({r.status_code}). Check GEMINI_API_KEY."
             break                   # 404/5xx etc: try next model
-    return None, None, last_err
+        errors.append(last_err)
+    return None, None, "No Gemini model worked. " + " | ".join(e[:110] for e in errors[:3])
 
 
 def generate_batch(format_name, topic, seen_titles):
