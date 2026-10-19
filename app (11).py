@@ -1,0 +1,426 @@
+"""
+Title Studio — a small, separate Streamlit app that serves ONE video title at a time.
+
+  Use this  -> saved as "used", never offered again, shown in the Used list
+  Skip      -> saved as "skipped", never offered again, next title appears
+
+Titles come from Gemini (free text tier). One Gemini call makes ~10 candidates;
+the app filters them (length, banned claims, duplicates of anything you already
+used/skipped) and serves the best-scored one first. History is saved to
+Backblaze B2 (same bucket as your pipeline, under titles/) if B2 secrets exist,
+otherwise to a local file that is lost on reboot.
+
+Secrets (Streamlit Cloud > Settings > Secrets):
+  GEMINI_API_KEY = "..."            (required)
+  GEMINI_MODEL   = "gemini-2.5-flash"   (optional override)
+  B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT_URL  (optional)
+"""
+
+import json
+import os
+import re
+import time
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+
+import requests
+import streamlit as st
+
+st.set_page_config(page_title="Title Studio", page_icon="🎯", layout="centered")
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+BATCH_SIZE = 10
+MAX_TITLE_CHARS = 70
+SIMILARITY_LIMIT = 0.72          # reject titles this similar to anything already seen
+HISTORY_KEY = "titles/history.json"
+LOCAL_HISTORY = "/tmp/title_history.json"
+
+FORMATS = {
+    "Any (best mix)": "Any of the formats below; choose what fits best.",
+    "Your Life at Every Level": "Tier progression told in second person: 'Your Life at Every Level of ___'.",
+    "POV story": "Second-person story: 'POV: You ___ — Everything Changed'. A fictional 'you' with real consequences.",
+    "Money mistake story": "A named or unnamed fictional person makes one money decision; the title hints at the cost.",
+    "Milestone / what changes": "'How Everything Changes After ___' (a savings or net-worth milestone).",
+    "Explained / history": "Crashes, bubbles, scams, famous money stories explained simply.",
+    "Two paths": "Two fictional people, same starting point, different choices.",
+}
+
+PILLARS = [
+    "saving money and savings milestones",
+    "debt, credit scores and interest",
+    "investing basics and compound growth",
+    "money psychology and spending habits",
+    "alternative funding (grants, crowdfunding, microloans, community lenders)",
+    "financial history: crashes, bubbles, scams",
+    "side hustles and small-business money decisions",
+    "everyday money traps (subscriptions, car payments, lifestyle creep)",
+]
+
+# Pattern library: structures that worked for reference channels in this niche.
+# They are given to the model as PATTERNS to learn from, never to copy.
+PATTERN_EXAMPLES = [
+    "Your Life at Every Level of Credit Score (300 to 850)",
+    "Your Life at Every Level of Compound Interest",
+    "A Day in the Life of a Quiet Millionaire",
+    "POV: You Chose Wealth Over Looking Rich",
+    "How Everything Changes After You Save $10,000",
+    "The Car Payment Trap Nobody Talks About",
+    "Who Can Actually Afford a $500K House (The Math Is Brutal)",
+    "Do This EVERY Time You Get Paid (Payday Routine)",
+    "The 2008 Financial Crisis Explained Like You're 5",
+    "The $63 BILLION Company That Sold Nothing",
+    "The Worst Time to be Rich as a Human",
+]
+
+BANNED = re.compile(
+    r"guarantee|risk[- ]free|get rich quick|double your money|100% (safe|profit|return)|"
+    r"can't lose|cannot lose|secret loophole|financial advice|buy now|"
+    r"you will (be|become) (a )?millionaire",
+    re.I,
+)
+
+SYSTEM_PROMPT = f"""You write YouTube video titles for a faceless, narrated, illustrated finance channel.
+Audience: English-speaking adults, 20+ (US/UK style English).
+Videos are 8-15 minute stories and explainers: personal finance, saving, building wealth,
+alternative funding, and money history, often told as a fictional person's story with real,
+realistic consequences and accurate numbers.
+
+Your job: produce titles with a high chance of being clicked AND watched, in the style of this niche.
+
+What makes a title work here:
+- One clear promise or reveal (a transformation, a consequence, a hidden cost, a comparison).
+- Curiosity gap: the viewer must feel they need the answer, but the title must be TRUE to the video.
+- Specific beats vague: a concrete number, stage, or situation ($10,000, 30 years, "every level").
+- Second person or a single clear character works well. Plain words, no jargon.
+- Under {MAX_TITLE_CHARS} characters. At most one word in ALL CAPS. No emoji, no hashtags.
+- The story must be deliverable by a narrated video with illustrated scenes (no charts needed to make the point).
+
+Hard rules:
+- Never promise guaranteed results, risk-free returns, get-rich-quick outcomes, or give personal financial advice.
+- Numbers must be plausible and illustrative; never invent fake statistics presented as fact.
+- Do not copy any example title; learn their structure and create new, original ones.
+- Every title in the batch must use a clearly different idea, not rewordings of each other.
+
+Pattern examples (structures only, do NOT reuse): {json.dumps(PATTERN_EXAMPLES)}
+
+Return ONLY a JSON array. Each item: {{"title": str, "format": str, "hook": str, "why": str, "score": int}}
+ - hook: the curiosity trigger in 6 words or fewer
+ - why: one short sentence on why a viewer would click
+ - score: 1-100, your honest estimate of click-and-watch strength (be critical; use the whole range)
+"""
+
+# --------------------------------------------------------------------------
+# Storage (B2 optional, local fallback)
+# --------------------------------------------------------------------------
+
+def _secret(name, default=None):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return default
+
+
+def _b2_ready():
+    return all(_secret(k) for k in ["B2_KEY_ID", "B2_APPLICATION_KEY", "B2_BUCKET_NAME", "B2_ENDPOINT_URL"])
+
+
+def _b2_client():
+    import boto3
+    return boto3.client(
+        "s3",
+        endpoint_url=_secret("B2_ENDPOINT_URL"),
+        aws_access_key_id=_secret("B2_KEY_ID"),
+        aws_secret_access_key=_secret("B2_APPLICATION_KEY"),
+    )
+
+
+def empty_history():
+    return {"used": [], "skipped": []}
+
+
+def load_history():
+    """Returns (history_dict, storage_label)."""
+    if _b2_ready():
+        try:
+            obj = _b2_client().get_object(Bucket=_secret("B2_BUCKET_NAME"), Key=HISTORY_KEY)
+            data = json.loads(obj["Body"].read().decode("utf-8"))
+            data.setdefault("used", [])
+            data.setdefault("skipped", [])
+            return data, "Backblaze B2 (permanent)"
+        except Exception as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                return empty_history(), "Backblaze B2 (permanent)"
+            # fall through to local if B2 had a real error
+    if os.path.exists(LOCAL_HISTORY):
+        try:
+            with open(LOCAL_HISTORY, encoding="utf-8") as f:
+                data = json.load(f)
+            data.setdefault("used", [])
+            data.setdefault("skipped", [])
+            return data, "local file (lost on reboot)"
+        except Exception:
+            pass
+    return empty_history(), ("Backblaze B2 (permanent)" if _b2_ready() else "local file (lost on reboot)")
+
+
+def save_history(history):
+    payload = json.dumps(history, ensure_ascii=False, indent=1)
+    try:
+        with open(LOCAL_HISTORY, "w", encoding="utf-8") as f:
+            f.write(payload)
+    except Exception:
+        pass
+    if _b2_ready():
+        for _ in range(3):
+            try:
+                _b2_client().put_object(
+                    Bucket=_secret("B2_BUCKET_NAME"), Key=HISTORY_KEY,
+                    Body=payload.encode("utf-8"), ContentType="application/json",
+                )
+                return True
+            except Exception:
+                time.sleep(1)
+        return False
+    return True
+
+# --------------------------------------------------------------------------
+# Title logic
+# --------------------------------------------------------------------------
+
+def normalize(t):
+    return re.sub(r"[^a-z0-9 ]+", "", t.lower()).strip()
+
+
+def too_similar(title, seen_titles):
+    n = normalize(title)
+    for s in seen_titles:
+        if SequenceMatcher(None, n, normalize(s)).ratio() >= SIMILARITY_LIMIT:
+            return True
+    return False
+
+
+def clean_candidate(item):
+    """Validate one model item. Returns cleaned dict or None."""
+    if not isinstance(item, dict):
+        return None
+    title = str(item.get("title", "")).strip().strip('"').strip()
+    if not title or len(title) > MAX_TITLE_CHARS or len(title) < 12:
+        return None
+    if BANNED.search(title):
+        return None
+    caps_words = [w for w in re.findall(r"[A-Za-z']+", title) if len(w) > 2 and w.isupper()]
+    if len(caps_words) > 1:
+        return None
+    try:
+        score = int(item.get("score", 50))
+    except Exception:
+        score = 50
+    return {
+        "title": title,
+        "format": str(item.get("format", ""))[:40],
+        "hook": str(item.get("hook", ""))[:60],
+        "why": str(item.get("why", ""))[:200],
+        "score": max(1, min(100, score)),
+    }
+
+
+def parse_batch(text):
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\[.*\]", text, re.S)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return []
+    if isinstance(data, dict):
+        data = data.get("titles", [])
+    return data if isinstance(data, list) else []
+
+
+def call_gemini(user_prompt):
+    """Returns (text, model_used, error_message)."""
+    key = _secret("GEMINI_API_KEY")
+    if not key:
+        return None, None, "GEMINI_API_KEY is missing from Secrets."
+    models = [_secret("GEMINI_MODEL")] if _secret("GEMINI_MODEL") else []
+    models += [m for m in MODEL_CANDIDATES if m not in models]
+    last_err = "unknown error"
+    for model in models:
+        body = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {
+                "temperature": 1.0,
+                "responseMimeType": "application/json",
+            },
+        }
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    API_URL.format(model=model), json=body,
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    timeout=60,
+                )
+            except Exception as e:
+                last_err = f"{model}: network error {type(e).__name__}"
+                time.sleep(2)
+                continue
+            if r.status_code == 200:
+                try:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    return "".join(p.get("text", "") for p in parts), model, None
+                except Exception:
+                    last_err = f"{model}: empty or blocked response"
+                    break
+            last_err = f"{model}: HTTP {r.status_code} {r.text[:160]}"
+            if r.status_code == 429:
+                time.sleep(3)      # brief wait, then try once more / next model
+                continue
+            if r.status_code in (400, 401, 403):
+                if "API key" in r.text or r.status_code in (401, 403):
+                    return None, None, f"Gemini rejected the API key ({r.status_code}). Check GEMINI_API_KEY."
+            break                   # 404/5xx etc: try next model
+    return None, None, last_err
+
+
+def generate_batch(format_name, topic, seen_titles):
+    fmt_desc = FORMATS.get(format_name, FORMATS["Any (best mix)"])
+    topic_line = topic.strip() if topic.strip() else "Choose varied topics from: " + "; ".join(PILLARS)
+    recent = seen_titles[-60:]
+    prompt = (
+        f"Write {BATCH_SIZE} new titles.\n"
+        f"Format wanted: {format_name} — {fmt_desc}\n"
+        f"Topic/angle: {topic_line}\n"
+        f"Do NOT produce anything similar to these already seen titles:\n{json.dumps(recent)}\n"
+    )
+    text, model, err = call_gemini(prompt)
+    if err:
+        return [], err, None
+    items = [clean_candidate(i) for i in parse_batch(text)]
+    items = [i for i in items if i]
+    fresh, taken = [], list(seen_titles)
+    for it in sorted(items, key=lambda x: -x["score"]):
+        if not too_similar(it["title"], taken):
+            fresh.append(it)
+            taken.append(it["title"])
+    if not fresh:
+        return [], "Gemini replied, but no usable new titles passed the filters. Press the Get a title button to try again.", model
+    return fresh, None, model
+
+# --------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------
+
+def init_state():
+    if "history" not in st.session_state:
+        h, label = load_history()
+        st.session_state.history = h
+        st.session_state.storage_label = label
+        st.session_state.queue = []
+        st.session_state.current = None
+        st.session_state.last_error = None
+        st.session_state.last_model = None
+        st.session_state.save_failed = False
+
+
+def seen_titles():
+    h = st.session_state.history
+    return [x["title"] for x in h["used"]] + [x["title"] for x in h["skipped"]]
+
+
+def advance(format_name, topic):
+    """Make st.session_state.current the next title, fetching a batch if needed."""
+    st.session_state.last_error = None
+    if not st.session_state.queue:
+        seen = seen_titles()
+        batch, err, model = generate_batch(format_name, topic, seen)
+        st.session_state.last_model = model
+        if err:
+            st.session_state.last_error = err
+            st.session_state.current = None
+            return
+        st.session_state.queue = batch
+    st.session_state.current = st.session_state.queue.pop(0)
+
+
+def record(kind, cand):
+    entry = {
+        "title": cand["title"], "format": cand.get("format", ""),
+        "score": cand.get("score"), "hook": cand.get("hook", ""),
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    st.session_state.history[kind].append(entry)
+    st.session_state.save_failed = not save_history(st.session_state.history)
+
+
+init_state()
+
+st.title("🎯 Title Studio")
+st.caption("One title at a time. Use it or skip it — it never comes back.")
+
+with st.sidebar:
+    st.subheader("Settings")
+    format_name = st.selectbox("Format", list(FORMATS.keys()))
+    topic = st.text_input("Topic or angle (optional)",
+                          placeholder="e.g. credit cards, first $10,000, a bubble…")
+    st.caption(f"History saved to: **{st.session_state.storage_label}**")
+    st.caption(f"Used: {len(st.session_state.history['used'])} · "
+               f"Skipped: {len(st.session_state.history['skipped'])}")
+    if not _secret("GEMINI_API_KEY"):
+        st.error("Add GEMINI_API_KEY in Secrets.")
+
+if st.session_state.save_failed:
+    st.warning("Couldn't save history to B2 just now. It's kept for this session; it will retry on the next action.")
+
+cur = st.session_state.current
+
+if cur is None:
+    if st.session_state.last_error:
+        st.error(st.session_state.last_error)
+    if st.button("Get a title", type="primary", use_container_width=True):
+        advance(format_name, topic)
+        st.rerun()
+else:
+    st.markdown("### Your title")
+    st.code(cur["title"], language=None)          # built-in copy button
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Strength", f"{cur['score']}/100")
+    c2.metric("Format", cur["format"] or "—")
+    c3.metric("Length", f"{len(cur['title'])} chars")
+    if cur.get("hook"):
+        st.write(f"**Hook:** {cur['hook']}")
+    if cur.get("why"):
+        st.write(f"**Why it works:** {cur['why']}")
+    st.caption("Strength is Gemini's own estimate, not real YouTube data. "
+               "Your real click-through rate after publishing is the true test.")
+
+    b1, b2 = st.columns(2)
+    if b1.button("✅ Use this", type="primary", use_container_width=True):
+        record("used", cur)
+        st.session_state.current = None
+        st.rerun()
+    if b2.button("⏭ Skip", use_container_width=True):
+        record("skipped", cur)
+        advance(format_name, topic)
+        st.rerun()
+
+if st.session_state.last_error and cur is not None:
+    st.error(st.session_state.last_error)
+
+st.divider()
+with st.expander(f"Used titles ({len(st.session_state.history['used'])})"):
+    for x in reversed(st.session_state.history["used"]):
+        st.write(f"• {x['title']}  — {x.get('format', '')} · {x.get('score', '')}")
+with st.expander(f"Skipped titles ({len(st.session_state.history['skipped'])})"):
+    for x in reversed(st.session_state.history["skipped"][-50:]):
+        st.write(f"• {x['title']}")
