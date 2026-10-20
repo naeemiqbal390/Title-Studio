@@ -19,6 +19,7 @@ Secrets (Streamlit Cloud > Settings > Secrets):
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -33,7 +34,7 @@ st.set_page_config(page_title="Title Studio", page_icon="🎯", layout="centered
 # --------------------------------------------------------------------------
 GEMINI_FALLBACK = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]   # last resort only; names get retired
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-BATCH_SIZE = 10
+BATCH_SIZE = 8
 MAX_TITLE_CHARS = 70
 SIMILARITY_LIMIT = 0.72          # reject titles this similar to anything already seen
 HISTORY_KEY = "titles/history.json"
@@ -128,14 +129,20 @@ def _b2_ready():
     return all(_secret(k) for k in ["B2_KEY_ID", "B2_APPLICATION_KEY", "B2_BUCKET_NAME", "B2_ENDPOINT_URL"])
 
 
-def _b2_client():
+@st.cache_resource
+def _b2_client_for(endpoint, key_id, app_key):
+    """Created once and reused (importing boto3 and building a client on every click was slow)."""
     import boto3
-    return boto3.client(
-        "s3",
-        endpoint_url=_secret("B2_ENDPOINT_URL"),
-        aws_access_key_id=_secret("B2_KEY_ID"),
-        aws_secret_access_key=_secret("B2_APPLICATION_KEY"),
-    )
+    return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=key_id, aws_secret_access_key=app_key)
+
+
+def _b2_params():
+    return (_secret("B2_ENDPOINT_URL"), _secret("B2_KEY_ID"), _secret("B2_APPLICATION_KEY"), _secret("B2_BUCKET_NAME"))
+
+
+def _b2_client():
+    endpoint, key_id, app_key, _ = _b2_params()
+    return _b2_client_for(endpoint, key_id, app_key)
 
 
 def empty_history():
@@ -168,7 +175,24 @@ def load_history():
     return empty_history(), ("Backblaze B2 (permanent)" if _b2_ready() else "local file (lost on reboot)")
 
 
+def _save_to_b2(payload, client, bucket, lock, status):
+    """Runs in a background thread so Skip / Use This never wait on the network.
+    Everything it needs is passed in (the thread has no Streamlit context)."""
+    with lock:
+        ok = False
+        for _ in range(3):
+            try:
+                client.put_object(Bucket=bucket, Key=HISTORY_KEY, Body=payload.encode("utf-8"),
+                                  ContentType="application/json")
+                ok = True
+                break
+            except Exception:
+                time.sleep(1)
+        status["b2_save_ok"] = ok
+
+
 def save_history(history):
+    """Local file is written instantly; the B2 copy is uploaded in the background."""
     payload = json.dumps(history, ensure_ascii=False, indent=1)
     try:
         with open(LOCAL_HISTORY, "w", encoding="utf-8") as f:
@@ -176,17 +200,16 @@ def save_history(history):
     except Exception:
         pass
     if _b2_ready():
-        for _ in range(3):
-            try:
-                _b2_client().put_object(
-                    Bucket=_secret("B2_BUCKET_NAME"), Key=HISTORY_KEY,
-                    Body=payload.encode("utf-8"), ContentType="application/json",
-                )
-                return True
-            except Exception:
-                time.sleep(1)
-        return False
+        try:
+            client = _b2_client()
+            bucket = _secret("B2_BUCKET_NAME")
+            lock = _MODEL_CACHE.setdefault("save_lock", threading.Lock())
+            threading.Thread(target=_save_to_b2, args=(payload, client, bucket, lock, _MODEL_CACHE),
+                             daemon=True).start()
+        except Exception:
+            _MODEL_CACHE["b2_save_ok"] = False
     return True
+
 
 # --------------------------------------------------------------------------
 # Title logic
@@ -247,7 +270,13 @@ def parse_batch(text):
     return data if isinstance(data, list) else []
 
 
-_MODEL_CACHE = {}
+@st.cache_resource
+def _get_model_cache():
+    """One dict that survives Streamlit's re-run of this script on every click."""
+    return {}
+
+
+_MODEL_CACHE = _get_model_cache()
 
 
 def discover_models(api_key):
@@ -258,7 +287,7 @@ def discover_models(api_key):
     found = []
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         params={"pageSize": 200}, headers={"x-goog-api-key": api_key}, timeout=20)
+                         params={"pageSize": 200}, headers={"x-goog-api-key": api_key}, timeout=8)
         if r.status_code == 200:
             skip = ("image", "tts", "audio", "live", "embed", "robot", "computer", "vision", "learnlm", "gemma")
             rows = []
@@ -294,49 +323,52 @@ def candidate_models(api_key, override=""):
 
 
 def call_gemini(user_prompt):
-    """Returns (text, model_used, error_message)."""
+    """Returns (text, model_used, error_message). Tuned for speed: remembers the model that worked,
+    turns off 'thinking' (slow, and not needed for titles), fails over without waiting."""
     key = _secret("GEMINI_API_KEY")
     if not key:
         return None, None, "GEMINI_API_KEY is missing from Secrets."
     models = candidate_models(key, _secret("GEMINI_MODEL") or "")
+    good = _MODEL_CACHE.get("good")
+    if good in models:                       # last model that worked goes first
+        models = [good] + [m for m in models if m != good]
     errors = []
-    last_err = "unknown error"
     for model in models:
-        body = {
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "temperature": 1.0,
-                "responseMimeType": "application/json",
-            },
-        }
+        use_thinking_off = _MODEL_CACHE.get("no_think_ok", True)
         for attempt in range(2):
+            gen = {"temperature": 1.0, "responseMimeType": "application/json", "maxOutputTokens": 2048}
+            if use_thinking_off:
+                gen["thinkingConfig"] = {"thinkingBudget": 0}
+            body = {
+                "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": gen,
+            }
             try:
                 r = requests.post(
                     API_URL.format(model=model), json=body,
                     headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                    timeout=60,
+                    timeout=40,
                 )
             except Exception as e:
-                last_err = f"{model}: network error {type(e).__name__}"
-                time.sleep(2)
-                continue
+                errors.append(f"{model}: network error {type(e).__name__}")
+                break
             if r.status_code == 200:
                 try:
                     parts = r.json()["candidates"][0]["content"]["parts"]
+                    _MODEL_CACHE["good"] = model
+                    _MODEL_CACHE["no_think_ok"] = use_thinking_off
                     return "".join(p.get("text", "") for p in parts), model, None
                 except Exception:
-                    last_err = f"{model}: empty or blocked response"
+                    errors.append(f"{model}: empty or blocked response")
                     break
-            last_err = f"{model}: HTTP {r.status_code} {r.text[:160]}"
-            if r.status_code == 429:
-                time.sleep(3)      # brief wait, then try once more / next model
+            if r.status_code == 400 and use_thinking_off and "think" in r.text.lower():
+                use_thinking_off = False     # this model doesn't accept the setting: retry once without it
                 continue
-            if r.status_code in (400, 401, 403):
-                if "API key" in r.text or r.status_code in (401, 403):
-                    return None, None, f"Gemini rejected the API key ({r.status_code}). Check GEMINI_API_KEY."
-            break                   # 404/5xx etc: try next model
-        errors.append(last_err)
+            errors.append(f"{model}: HTTP {r.status_code} {r.text[:120]}")
+            if r.status_code in (401, 403):
+                return None, None, f"Gemini rejected the API key ({r.status_code}). Check GEMINI_API_KEY."
+            break                            # 404 / 429 / 5xx: next model right away, no waiting
     return None, None, "No Gemini model worked. " + " | ".join(e[:110] for e in errors[:3])
 
 
@@ -390,8 +422,11 @@ def advance(format_name, topic):
     st.session_state.last_error = None
     if not st.session_state.queue:
         seen = seen_titles()
-        batch, err, model = generate_batch(format_name, topic, seen)
+        t0 = time.time()
+        with st.spinner("Writing titles (usually a few seconds)…"):
+            batch, err, model = generate_batch(format_name, topic, seen)
         st.session_state.last_model = model
+        st.session_state.last_seconds = round(time.time() - t0, 1)
         if err:
             st.session_state.last_error = err
             st.session_state.current = None
@@ -420,13 +455,15 @@ with st.sidebar:
     format_name = st.selectbox("Format", list(FORMATS.keys()))
     topic = st.text_input("Topic or angle (optional)",
                           placeholder="e.g. credit cards, first $10,000, a bubble…")
+    if st.session_state.get("last_model"):
+        st.caption(f"Last batch: {st.session_state.last_model}, {st.session_state.get('last_seconds', '?')} s")
     st.caption(f"History saved to: **{st.session_state.storage_label}**")
     st.caption(f"Used: {len(st.session_state.history['used'])} · "
                f"Skipped: {len(st.session_state.history['skipped'])}")
     if not _secret("GEMINI_API_KEY"):
         st.error("Add GEMINI_API_KEY in Secrets.")
 
-if st.session_state.save_failed:
+if _MODEL_CACHE.get("b2_save_ok") is False:
     st.warning("Couldn't save history to B2 just now. It's kept for this session; it will retry on the next action.")
 
 cur = st.session_state.current
