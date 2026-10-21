@@ -75,6 +75,12 @@ PATTERN_EXAMPLES = [
     "The 2008 Financial Crisis Explained Like You're 5",
     "The $63 BILLION Company That Sold Nothing",
     "The Worst Time to be Rich as a Human",
+    "How To Survive a Layoff With Six Weeks of Savings",
+    "Surviving $50,000 of Debt: The First Year",
+    "Debt Survival: Month by Month",
+    "Your First Year After You Quit Your Job",
+    "Is the 50/30/20 Rule Real?",
+    "What Happens to Your Money If the Bank Fails?",
 ]
 
 BANNED = re.compile(
@@ -97,6 +103,7 @@ What makes a title work here:
 - Curiosity gap: the viewer must feel they need the answer, but the title must be TRUE to the video.
 - Specific beats vague: a concrete number, stage, or situation ($10,000, 30 years, "every level").
 - Second person or a single clear character works well. Plain words, no jargon.
+- Short plain titles that name a situation and a time span or amount ("X Survival 1 Year", "How To Survive Y") also work well; do not force every title into a curiosity-gap shape.
 - Under {MAX_TITLE_CHARS} characters. At most one word in ALL CAPS. No emoji, no hashtags.
 - The story must be deliverable by a narrated video with illustrated scenes (no charts needed to make the point).
 
