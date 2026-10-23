@@ -75,6 +75,11 @@ PATTERN_EXAMPLES = [
     "The 2008 Financial Crisis Explained Like You're 5",
     "The $63 BILLION Company That Sold Nothing",
     "The Worst Time to be Rich as a Human",
+    "POV: You Stop Chasing Status and Start Living Like Old Money",
+    "POV: You Became the Rich Friend, Then Things Got Awkward",
+    "POV: You Keep the Same Car for 10 Years While Everyone Else Upgrades",
+    "POV: You Pay Off Your House While Everyone Else Still Has a Mortgage",
+    "POV: You Look Broke, But You're Quietly Getting Rich",
     "How To Survive a Layoff With Six Weeks of Savings",
     "Surviving $50,000 of Debt: The First Year",
     "Debt Survival: Month by Month",
@@ -103,6 +108,7 @@ What makes a title work here:
 - Curiosity gap: the viewer must feel they need the answer, but the title must be TRUE to the video.
 - Specific beats vague: a concrete number, stage, or situation ($10,000, 30 years, "every level").
 - Second person or a single clear character works well. Plain words, no jargon.
+- A proven shape in this niche: "POV: You [quiet choice], [and the surprising social or money consequence]" (the viewer is the character; the title shows a contrast between how you look and what is really happening). Use it for about a third of a batch, with fresh scenarios each time.
 - Short plain titles that name a situation and a time span or amount ("X Survival 1 Year", "How To Survive Y") also work well; do not force every title into a curiosity-gap shape.
 - Under {MAX_TITLE_CHARS} characters. At most one word in ALL CAPS. No emoji, no hashtags.
 - The story must be deliverable by a narrated video with illustrated scenes (no charts needed to make the point).
